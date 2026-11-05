@@ -1,0 +1,6 @@
+{
+  "name": "3D FPS Arena",
+  "description": "A complete playable 3D first-person shooter survival arena game with wave-based tactical combat, procedural 3D weapon and enemy models, and AI tactical combat debriefing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
