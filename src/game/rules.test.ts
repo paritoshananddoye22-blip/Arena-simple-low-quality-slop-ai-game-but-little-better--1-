@@ -601,4 +601,182 @@ test('3D sound spatializer attenuates gain and lowpass cutoff with distance, pan
   const distantPos = selectDistantGunfirePosition(2, 5, () => 0.5);
   const distFromCenter = Math.hypot(distantPos.x, distantPos.z);
   assert.ok(distFromCenter >= 24 && distFromCenter <= 38);
+
+  // 5. Turning away from a gunshot or emitter never makes it louder than facing it
+  const facingSource = compute3DSpatialAudioParams(
+    { x: 0, y: 1.65, z: 0, yaw: 0 },
+    { x: 0, y: 1.65, z: -8 },
+  );
+  const turnedAwayFromSource = compute3DSpatialAudioParams(
+    { x: 0, y: 1.65, z: 0, yaw: Math.PI },
+    { x: 0, y: 1.65, z: -8 },
+  );
+  assert.ok(turnedAwayFromSource.attenuationGain <= facingSource.attenuationGain);
+  assert.ok(turnedAwayFromSource.lowpassCutoffHz < facingSource.lowpassCutoffHz);
 });
+
+test('Zoiemre mini-boss (<=500 triangles) respects strict low-poly geometry budget, runner zombie is removed, and layered gunshot system randomizes Transient, Body, and Mechanical samples and pitches independently', async () => {
+  const { inspectEnemyModelMetrics, buildEnemyModel } = await import('./models');
+  const {
+    getEnemyArchetypeProfile,
+    getWaveConfig,
+    createKillFeedEntry,
+    pickEnemyArchetype,
+    selectLayeredGunshotParams,
+  } = await import('./rules');
+
+  // Verify Zoiemre ('brute') geometry budget and separated non-rendered hitboxes
+  const zoiemreMetrics = inspectEnemyModelMetrics('brute', true);
+  assert.ok(
+    zoiemreMetrics.characterTriangles <= 500 && zoiemreMetrics.characterTriangles >= 380,
+    `Expected Zoiemre character triangles in 380..500, got ${zoiemreMetrics.characterTriangles}`,
+  );
+  assert.ok(
+    zoiemreMetrics.totalVisibleTriangles <= 500,
+    `Expected Zoiemre total visible triangles <= 500, got ${zoiemreMetrics.totalVisibleTriangles}`,
+  );
+  assert.ok(
+    zoiemreMetrics.materialCount >= 1 && zoiemreMetrics.materialCount <= 3,
+    `Expected Zoiemre material count 1..3, got ${zoiemreMetrics.materialCount}`,
+  );
+  assert.equal(zoiemreMetrics.textureSize, '256x256');
+
+  const zoiemreRig = buildEnemyModel(502, 'brute', true);
+  assert.equal(zoiemreRig.hitMeshes.length, 2);
+  assert.ok(zoiemreRig.hitMeshes.every((m) => ((m as any).material?.visible === false)));
+
+  // Verify Zoiemre combat profile and kill feed label ('Zoiemre')
+  const wave2Cfg = getWaveConfig(2);
+  const zoiemreProfile = getEnemyArchetypeProfile('brute', wave2Cfg);
+  assert.equal(zoiemreProfile.displayName, 'Zoiemre');
+  assert.ok(zoiemreProfile.hp >= wave2Cfg.enemyHp * 2.4);
+
+  const zoiemreKill = createKillFeedEntry(11, 'brute', true, 4.0);
+  assert.equal(zoiemreKill.archetypeLabel, 'Zoiemre');
+
+  // Verify 'runner' is completely removed from wave spawning across waves 1..4
+  for (let w = 1; w <= 4; w++) {
+    for (let i = 0; i < 12; i++) {
+      const arch = pickEnemyArchetype(w, i);
+      assert.notEqual(arch as string, 'runner');
+    }
+  }
+
+  // Verify layered weapon audio system selects separate Transient, Body, and Mechanical samples
+  // with anti-repeat per layer and independent pitch randomization
+  let history = {
+    lastTransientIndex: -1,
+    lastBodyIndex: -1,
+    lastMechanicalIndex: -1,
+  };
+  let rngStep = 0;
+  const mockRng = () => {
+    rngStep = (rngStep + 1) % 29;
+    return (rngStep * 0.137) % 1;
+  };
+
+  for (const weaponId of ['rifle', 'shotgun', 'pistol'] as const) {
+    let prevRes = selectLayeredGunshotParams(weaponId, history, 3, mockRng);
+    history = prevRes.nextHistory;
+
+    for (let shot = 0; shot < 15; shot++) {
+      const nextRes = selectLayeredGunshotParams(weaponId, history, 3, mockRng);
+      const nextSelection = nextRes.selection;
+      const prevSelection = prevRes.selection;
+      // Anti-repeat guarantees consecutive shots never repeat the same sample index in any layer
+      assert.notEqual(
+        nextSelection.transientSampleIndex,
+        prevSelection.transientSampleIndex,
+        `Transient sample repeated on consecutive ${weaponId} shots`,
+      );
+      assert.notEqual(
+        nextSelection.bodySampleIndex,
+        prevSelection.bodySampleIndex,
+        `Body sample repeated on consecutive ${weaponId} shots`,
+      );
+      assert.notEqual(
+        nextSelection.mechanicalSampleIndex,
+        prevSelection.mechanicalSampleIndex,
+        `Mechanical sample repeated on consecutive ${weaponId} shots`,
+      );
+
+      // Verify pitch randomization stays within natural acoustic bounds
+      assert.ok(nextSelection.transientPitch >= 0.9 && nextSelection.transientPitch <= 1.1);
+      assert.ok(nextSelection.bodyPitch >= 0.91 && nextSelection.bodyPitch <= 1.09);
+      assert.ok(nextSelection.mechanicalPitch >= 0.9 && nextSelection.mechanicalPitch <= 1.1);
+      assert.ok(nextSelection.tailPitch >= 0.92 && nextSelection.tailPitch <= 1.08);
+
+      prevRes = nextRes;
+      history = nextRes.nextHistory;
+    }
+  }
+});
+
+test('advanced A* + string-pulling + context-steering pathfinding routes enemies around wide obstacles without getting stuck', async () => {
+  const {
+    computeAdvancedPathfindingDirection,
+    hasClearLineOfSight2D,
+  } = await import('./rules');
+
+  const wideWallObstacle = [
+    {
+      id: 'test-wide-wall',
+      kind: 'barrier' as const,
+      x: 0,
+      z: 0,
+      width: 8.4,
+      depth: 2.4,
+      height: 1.8,
+    },
+  ];
+
+  // Direct line from (0, -5) to (0, 5) is blocked by the wide wall
+  assert.equal(hasClearLineOfSight2D(0, -5, 0, 5, 0.55, wideWallObstacle), false);
+  // Line around the side from (6, -5) to (6, 5) is clear
+  assert.equal(hasClearLineOfSight2D(6, -5, 6, 5, 0.55, wideWallObstacle), true);
+
+  // Pathfinding at (0, -5) aiming for (0, 5) produces a lateral steering vector around the wall
+  const dir = computeAdvancedPathfindingDirection(0, -5, 0, 5, wideWallObstacle, 0.55);
+  assert.ok(Math.abs(dir.dirX) > 0.35, `Expected lateral detour dirX, got ${dir.dirX}`);
+
+  // Simulate an enemy starting at (0, -4.5) navigating around the wide wall to reach player at (0, 4.5)
+  let enemy: EnemyData = {
+    id: 77,
+    archetype: 'flanker',
+    x: 0,
+    y: 0,
+    z: -4.5,
+    vx: 0,
+    vz: 0,
+    yaw: 0,
+    hp: 80,
+    maxHp: 80,
+    speed: 4.2,
+    attackDamage: 10,
+    attackRange: 1.9,
+    attackCooldownSec: 1.0,
+    attackTimerSec: 0,
+    windupTimerSec: 0,
+    isWindingUp: false,
+    hitFlashTimerSec: 0,
+    walkCycle: 0,
+    isDead: false,
+    deathTimerSec: 0,
+    flankSign: 1,
+  };
+
+  for (let step = 0; step < 120; step++) {
+    const res = stepEnemyAI(enemy, 0, 4.5, 0.05, [enemy], wideWallObstacle, true);
+    enemy = res.enemy;
+    if (Math.hypot(enemy.x - 0, enemy.z - 4.5) <= 1.8) {
+      break;
+    }
+  }
+
+  const finalDistToPlayer = Math.hypot(enemy.x - 0, enemy.z - 4.5);
+  assert.ok(
+    finalDistToPlayer < 2.2,
+    `Expected enemy to navigate around wide wall and reach player (<2.2m), got ${finalDistToPlayer.toFixed(2)}m at (${enemy.x.toFixed(2)}, ${enemy.z.toFixed(2)})`,
+  );
+});
+

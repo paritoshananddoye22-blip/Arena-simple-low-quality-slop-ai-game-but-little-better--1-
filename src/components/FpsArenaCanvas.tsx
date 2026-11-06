@@ -37,6 +37,7 @@ import {
   createProceduralMuzzleFlashBurst,
   detectEnemyFootstepPhaseCrossing,
   fireWeaponRound,
+  getEnemyArchetypeProfile,
   getSurfaceImpactProfile,
   getWaveConfig,
   pickEnemyArchetype,
@@ -74,10 +75,17 @@ import {
   buildHealthPotionModel,
   buildPistolModel,
   buildShotgunModel,
+  inspectEnemyModelMetrics,
   type AssaultRifleRig,
+  type EnemyModelMetrics,
   type EnemyRig,
 } from '../game/models';
-import { soundSystem, type SpatialAudioDebugStats } from '../game/sound';
+import {
+  soundSystem,
+  type AudioEnvironmentMode,
+  type SpatialAudioDebugStats,
+  type WeaponAudioDiagnostics,
+} from '../game/sound';
 import type { HudSnapshot } from './GameHud';
 
 // Pre-allocated math helpers outside the render loop (Zero-GC discipline)
@@ -190,6 +198,18 @@ export interface FpsGameController {
     burstCount?: number,
   ) => SpatialAudioParams;
   triggerSpatialAmbianceAt: (emitterIndex?: number) => SpatialAudioParams;
+  triggerSpatialWeaponFireAt: (
+    weaponId: WeaponId,
+    x: number,
+    y: number,
+    z: number,
+  ) => SpatialAudioParams;
+  setAudioEnvironmentMode: (mode: AudioEnvironmentMode) => AudioEnvironmentMode;
+  spawnEnemyOfArchetype: (
+    archetype: EnemyArchetype,
+    x?: number,
+    z?: number,
+  ) => EnemyData;
   simulatePlayerDamage: (amount: number) => void;
   aimAtNearestEnemy: (headshot?: boolean) => boolean;
   getDebugState: () => {
@@ -202,6 +222,7 @@ export interface FpsGameController {
     weaponBobSway: WeaponBobSwayState;
     spatialAudio: SpatialAudioDebugStats;
     activeEnemyCount: number;
+    activeEnemies: EnemyData[];
     activeAmmoPickupCount: number;
     activeHealthPotionCount: number;
     activeDecalCount: number;
@@ -209,6 +230,10 @@ export interface FpsGameController {
     activeMuzzleFlashBurstCount: number;
     totalMuzzleFlashBurstsSpawned: number;
     explosionsTriggered: number;
+    revolverPolygonCount: number;
+    shotgunPolygonCount: number;
+    enemyModelMetrics: Record<EnemyArchetype, EnemyModelMetrics>;
+    weaponAudio: WeaponAudioDiagnostics;
   };
 }
 
@@ -800,6 +825,16 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
     let pendingLookDeltaYaw = 0;
     let pendingLookDeltaPitch = 0;
 
+    let reloadInsertionSoundPlayed = false;
+    let reloadBoltSoundPlayed = false;
+
+    const cachedEnemyModelMetrics: Record<EnemyArchetype, EnemyModelMetrics> = {
+      brute: inspectEnemyModelMetrics('brute', isSoftwareGl),
+      assault: inspectEnemyModelMetrics('assault', isSoftwareGl),
+      heavy: inspectEnemyModelMetrics('heavy', isSoftwareGl),
+      flanker: inspectEnemyModelMetrics('flanker', isSoftwareGl),
+    };
+
     // Input state
     const keysHeld = new Set<string>();
     let jumpJustPressed = false;
@@ -816,13 +851,18 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
       enemies = [];
     };
 
-    const spawnSingleEnemy = (waveNum: number, spawnIndex: number, atPos?: { x: number; z: number }) => {
+    const spawnSingleEnemy = (
+      waveNum: number,
+      spawnIndex: number,
+      atPos?: { x: number; z: number },
+      forcedArchetype?: EnemyArchetype,
+    ): EnemyData => {
       const cfg = getWaveConfig(waveNum);
       const pos = atPos ?? selectEnemySpawnPoint(player.x, player.z, spawnIndex, 11.5);
-      const archetype = pickEnemyArchetype(waveNum, spawnIndex);
+      const archetype = forcedArchetype ?? pickEnemyArchetype(waveNum, spawnIndex);
+      const profile = getEnemyArchetypeProfile(archetype, cfg);
       const id = nextEnemyId++;
 
-      const enemyHp = archetype === 'heavy' ? Math.round(cfg.enemyHp * 1.2) : cfg.enemyHp;
       const enemyData: EnemyData = {
         id,
         archetype,
@@ -832,11 +872,11 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
         vx: 0,
         vz: 0,
         yaw: Math.atan2(player.x - pos.x, player.z - pos.z),
-        hp: enemyHp,
-        maxHp: enemyHp,
-        speed: cfg.baseSpeed,
-        attackDamage: ENEMY_CONTACT_DAMAGE,
-        attackRange: ENEMY_ATTACK_RANGE,
+        hp: profile.hp,
+        maxHp: profile.hp,
+        speed: profile.speed,
+        attackDamage: profile.attackDamage ?? ENEMY_CONTACT_DAMAGE,
+        attackRange: profile.attackRange ?? ENEMY_ATTACK_RANGE,
         attackCooldownSec: ENEMY_ATTACK_COOLDOWN_SEC,
         attackTimerSec: 0.35,
         windupTimerSec: 0,
@@ -855,15 +895,16 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
 
       enemies.push(enemyData);
       enemyRigs.set(id, rig);
+      return enemyData;
     };
 
     const setupTitlePreviewEnemies = () => {
       clearAllEnemies();
       setupInitialAmmoPickups();
       resetExplosiveBarrels();
-      spawnSingleEnemy(1, 0, { x: -7, z: -4 });
-      spawnSingleEnemy(2, 1, { x: 6, z: 5 });
-      spawnSingleEnemy(3, 2, { x: 4, z: -8 });
+      spawnSingleEnemy(1, 0, { x: -7, z: -4 }, 'flanker');
+      spawnSingleEnemy(2, 1, { x: 6, z: 5 }, 'brute');
+      spawnSingleEnemy(3, 2, { x: 4, z: -8 }, 'assault');
     };
 
     const syncHudImmediate = () => {
@@ -1170,7 +1211,7 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
       muzzleFlashTimerSec = 0;
       muzzlePointLight.intensity = 0;
       updateWeaponRigVisibility(true);
-      soundSystem.playWeaponSwitch();
+      soundSystem.playWeaponSwitch(activeWeaponId);
       syncHudImmediate();
       return true;
     };
@@ -1341,7 +1382,7 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
       if (gameStateRef.current !== 'playing') return false;
       if (weapon.isReloading) return false;
       if (weapon.magazine <= 0) {
-        soundSystem.playDryFire();
+        soundSystem.playEmptyMagazineClick(weapon.id);
         return false;
       }
       if (!canFireWeapon(weapon, elapsedSimTimeSec)) return false;
@@ -1381,12 +1422,28 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
       cameraRecoilPitch = Math.min(0.11, cameraRecoilPitch + pitchKick);
       player.yaw += yawDrift;
       cameraRecoilRoll = (Math.random() - 0.5) * (weapon.id === 'shotgun' ? 0.026 : 0.018);
-      soundSystem.playWeaponFire(weapon.id);
 
       // Spawn volumetric muzzle smoke & 3D ejected shell casing
       activeRig.muzzleFlashGroup.getWorldPosition(_muzzleWorldPos);
       camera.getWorldDirection(_cameraDir);
       _cameraRight.crossVectors(_cameraDir, camera.up).normalize();
+
+      // Synchronized Mechanical Trigger Pull + Firing Mechanism + Spatial 5-Layer Gunshot
+      soundSystem.updateListenerPose(
+        player.x,
+        player.y + PLAYER_EYE_HEIGHT,
+        player.z,
+        player.yaw,
+        player.pitch,
+      );
+      soundSystem.playTriggerPull(weapon.id);
+      soundSystem.playFiringMechanism(weapon.id);
+      soundSystem.playSpatialWeaponFire(
+        weapon.id,
+        _muzzleWorldPos.x,
+        _muzzleWorldPos.y,
+        _muzzleWorldPos.z,
+      );
 
       for (let i = 0; i < 4; i++) {
         spawnParticle(
@@ -1478,22 +1535,34 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
         }
 
         if (closestEnemyHit && closestEnemyHit.distance < closestEnvDist) {
-          if (pelletIdx === 0) {
-            primaryTracerEnd.copy(closestEnemyHit.point);
-          }
           const hitEnemyId = closestEnemyHit.object.userData.enemyId as number;
-          const isHeadshot = Boolean(closestEnemyHit.object.userData.isHead);
+          // If the bullet ray touches any head hitbox on this enemy before hitting environment, register headshot
+          const headHitOnTarget = enemyHits.find(
+            (h) =>
+              h.distance < closestEnvDist &&
+              h.object.userData.enemyId === hitEnemyId &&
+              Boolean(h.object.userData.isHead) &&
+              h.distance <= closestEnemyHit.distance + 0.48,
+          );
+          const effectiveHit = headHitOnTarget ?? closestEnemyHit;
+          if (pelletIdx === 0) {
+            primaryTracerEnd.copy(effectiveHit.point);
+          }
+          const isHeadshot = Boolean(effectiveHit.object.userData.isHead);
           const pelletDmg = isHeadshot ? weapon.headshotDamage : weapon.damage;
 
           const prev = damageByEnemyId.get(hitEnemyId);
           if (prev) {
             prev.totalDamage += pelletDmg;
             prev.anyHeadshot = prev.anyHeadshot || isHeadshot;
+            if (isHeadshot) {
+              prev.hitPoint.copy(effectiveHit.point);
+            }
           } else {
             damageByEnemyId.set(hitEnemyId, {
               totalDamage: pelletDmg,
               anyHeadshot: isHeadshot,
-              hitPoint: closestEnemyHit.point.clone(),
+              hitPoint: effectiveHit.point.clone(),
             });
           }
         } else if (envHits.length > 0) {
@@ -1539,20 +1608,21 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
             hitstopTimerSec = Math.max(hitstopTimerSec, 0.024);
           }
 
-          const burstCount = anyHeadshot ? 12 : 7;
+          const burstCount = anyHeadshot ? 14 : 7;
           for (let p = 0; p < burstCount; p++) {
+            const isMetalSpark = anyHeadshot && p % 2 === 0;
             spawnParticle(
               hitPoint.x,
               hitPoint.y,
               hitPoint.z,
-              (Math.random() - 0.5) * 4.5,
-              1.2 + Math.random() * 3.0,
-              (Math.random() - 0.5) * 4.5,
-              anyHeadshot ? 1.0 : 0.94,
-              anyHeadshot ? 0.68 : 0.18,
-              0.18,
-              0.055,
-              0.32,
+              (Math.random() - 0.5) * (isMetalSpark ? 6.8 : 4.5),
+              1.4 + Math.random() * (isMetalSpark ? 4.2 : 3.0),
+              (Math.random() - 0.5) * (isMetalSpark ? 6.8 : 4.5),
+              isMetalSpark ? 1.0 : anyHeadshot ? 1.0 : 0.94,
+              isMetalSpark ? 0.92 : anyHeadshot ? 0.68 : 0.18,
+              isMetalSpark ? 0.55 : 0.18,
+              isMetalSpark ? 0.042 : 0.055,
+              isMetalSpark ? 0.26 : 0.32,
               0.9,
               0,
             );
@@ -1590,7 +1660,10 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
       if (!canReloadWeapon(weapon)) return false;
       weapon = startReloadWeapon(weapon);
       arsenal[activeWeaponId] = weapon;
-      soundSystem.playReloadStart();
+      reloadInsertionSoundPlayed = false;
+      reloadBoltSoundPlayed = false;
+      // Stage 1 Mechanical Event: Magazine removal / cylinder swing-out at 0% reload progress
+      soundSystem.playMagazineRemoval(weapon.id);
       syncHudImmediate();
       return true;
     };
@@ -1732,6 +1805,34 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
         );
         return soundSystem.playSpatialAmbiancePulse(emitterIndex);
       },
+      triggerSpatialWeaponFireAt: (
+        weaponId: WeaponId,
+        x: number,
+        y: number,
+        z: number,
+      ) => {
+        soundSystem.updateListenerPose(
+          player.x,
+          player.y + PLAYER_EYE_HEIGHT,
+          player.z,
+          player.yaw,
+          player.pitch,
+        );
+        return soundSystem.playSpatialWeaponFire(weaponId, x, y, z);
+      },
+      setAudioEnvironmentMode: (mode: AudioEnvironmentMode) =>
+        soundSystem.setEnvironmentMode(mode),
+      spawnEnemyOfArchetype: (
+        archetype: EnemyArchetype,
+        x?: number,
+        z?: number,
+      ) =>
+        spawnSingleEnemy(
+          stats.wave,
+          enemies.length,
+          x !== undefined && z !== undefined ? { x, z } : undefined,
+          archetype,
+        ),
       simulatePlayerDamage: (amount: number) => inflictPlayerDamage(amount),
       aimAtNearestEnemy: (headshot: boolean = false) => {
         const living = enemies.filter((e) => !e.isDead);
@@ -1774,6 +1875,9 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
         weaponBobSway: { ...bobSwayState },
         spatialAudio: soundSystem.getSpatialDebugStats(),
         activeEnemyCount: enemies.filter((e) => !e.isDead).length,
+        activeEnemies: enemies
+          .filter((e) => !e.isDead)
+          .map((e) => ({ ...e })),
         activeAmmoPickupCount: ammoPickups.filter(
           (p) => p.active && (p.pickupKind ?? 'ammo') === 'ammo',
         ).length,
@@ -1785,6 +1889,14 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
         activeMuzzleFlashBurstCount: activeMuzzleFlashBursts.length,
         totalMuzzleFlashBurstsSpawned,
         explosionsTriggered,
+        revolverPolygonCount: Number(
+          weaponRigs.pistol.root.userData.revolverPolygonCount ?? 0,
+        ),
+        shotgunPolygonCount: Number(
+          weaponRigs.shotgun.root.userData.shotgunPolygonCount ?? 0,
+        ),
+        enemyModelMetrics: cachedEnemyModelMetrics,
+        weaponAudio: soundSystem.getWeaponAudioDiagnostics(),
       }),
     };
 
@@ -2118,13 +2230,29 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
           }
         }
 
-        // Step Weapon Reload & Continuous Firing
+        // Step Weapon Reload & Staged Mechanical Audio Synchronization
         if (weapon.isReloading) {
           const reloadStep = stepWeaponReload(weapon, dt);
           weapon = reloadStep.weapon;
           arsenal[activeWeaponId] = weapon;
+          const progress =
+            weapon.reloadDurationSec > 0
+              ? (weapon.reloadDurationSec - weapon.reloadTimerSec) /
+                weapon.reloadDurationSec
+              : 1;
+          if (!reloadInsertionSoundPlayed && progress >= 0.48) {
+            reloadInsertionSoundPlayed = true;
+            // Stage 2 Mechanical Event: Magazine / shell insertion at ~48% reload animation
+            soundSystem.playMagazineInsertion(weapon.id);
+          }
+          if (!reloadBoltSoundPlayed && progress >= 0.76) {
+            reloadBoltSoundPlayed = true;
+            // Stage 3 Mechanical Event: Bolt release / pump slide rack at ~76% reload animation
+            soundSystem.playBoltOrSlideOperation(weapon.id);
+          }
           if (reloadStep.completed) {
-            soundSystem.playReloadComplete();
+            // Stage 4 Mechanical Event: Final breech battery lockup on reload completion
+            soundSystem.playReloadComplete(weapon.id);
             syncHudImmediate();
           }
         } else if (isMouseDown || keysHeld.has('KeyF')) {
@@ -2352,11 +2480,53 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
           reloadTiltX = reloadCurve * 0.38;
           reloadTiltZ = reloadCurve * 0.45;
           reloadDropY = -reloadCurve * 0.085;
-          const magSlide = Math.sin(progress * Math.PI) * 0.145;
-          activeRig.magazineMesh.position.y = -0.125 - magSlide;
+          if (activeWeaponId === 'pistol') {
+            // Revolver swing-out cylinder reload animation: swings left on crane arm and spins
+            activeRig.magazineMesh.position.set(
+              -reloadCurve * 0.048,
+              0.02 - reloadCurve * 0.014,
+              -0.002,
+            );
+            activeRig.magazineMesh.rotation.set(
+              Math.PI / 2,
+              progress * Math.PI * 4,
+              reloadCurve * 0.42,
+            );
+          } else if (activeWeaponId === 'shotgun') {
+            // Shotgun pump forend racks rearward at the end of shell loading
+            const pumpRack =
+              progress > 0.72
+                ? Math.sin(((progress - 0.72) / 0.28) * Math.PI) * 0.085
+                : 0;
+            activeRig.magazineMesh.position.set(0, -0.02, -0.34 + pumpRack);
+          } else {
+            const magSlide = reloadCurve * 0.145;
+            activeRig.magazineMesh.position.y = -0.125 - magSlide;
+          }
           if (progress > 0.76) {
             boltRackOffset = Math.sin(((progress - 0.76) / 0.24) * Math.PI) * 0.075;
           }
+        } else if (activeWeaponId === 'pistol') {
+          activeRig.magazineMesh.position.set(0, 0.02, -0.002);
+          const targetCylStep =
+            (weapon.magazineCapacity - weapon.magazine) * (Math.PI / 4);
+          activeRig.magazineMesh.rotation.set(
+            Math.PI / 2,
+            THREE.MathUtils.damp(
+              activeRig.magazineMesh.rotation.y,
+              targetCylStep,
+              18,
+              dt,
+            ),
+            0,
+          );
+        } else if (activeWeaponId === 'shotgun') {
+          // Shotgun pump forend slides rearward and forward during post-shot pump action
+          const pumpSlideZ = Math.min(
+            0.082,
+            Math.max(weapon.recoilAmount * 0.075, bobSwayState.recoilSpringZ * 1.1),
+          );
+          activeRig.magazineMesh.position.set(0, -0.02, -0.34 + pumpSlideZ);
         } else {
           activeRig.magazineMesh.position.y = -0.125;
         }
@@ -2399,10 +2569,20 @@ export const FpsArenaCanvas: React.FC<FpsArenaCanvasProps> = ({
           bobSwayState.totalRotY,
           bobSwayState.totalRotZ,
         );
-        activeRig.boltMesh.position.z =
-          -0.02 +
-          Math.max(weapon.recoilAmount * 0.068, bobSwayState.recoilSpringZ * 1.15) +
-          boltRackOffset;
+        if (activeWeaponId === 'pistol') {
+          // Revolver hammer spur cocks back & strikes on every shot
+          const hammerKick = Math.min(
+            1,
+            Math.max(weapon.recoilAmount, bobSwayState.recoilSpringZ * 12),
+          );
+          activeRig.boltMesh.position.set(0, 0.048, 0.072);
+          activeRig.boltMesh.rotation.x = -0.35 - hammerKick * 0.85;
+        } else {
+          activeRig.boltMesh.position.z =
+            -0.02 +
+            Math.max(weapon.recoilAmount * 0.068, bobSwayState.recoilSpringZ * 1.15) +
+            boltRackOffset;
+        }
 
         // First-Person Camera Position, Walking Bob, Landing Impact, Firing Kick & Trauma Shake
         const bobOffsetY = Math.sin(player.walkDistance * 2.8) * 0.042 * bobStrength;

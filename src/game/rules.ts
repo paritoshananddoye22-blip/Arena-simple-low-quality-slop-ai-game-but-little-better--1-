@@ -1,6 +1,6 @@
 export type GameState = 'title' | 'playing' | 'paused' | 'gameover';
 
-export type EnemyArchetype = 'assault' | 'flanker' | 'heavy';
+export type EnemyArchetype = 'assault' | 'flanker' | 'heavy' | 'brute';
 
 export type WeaponId = 'rifle' | 'shotgun' | 'pistol';
 
@@ -571,9 +571,83 @@ export const KILL_FEED_LIFETIME_SEC = 4.0;
 export const MAX_KILL_FEED_ITEMS = 5;
 
 export function getArchetypeDisplayName(archetype: EnemyArchetype): string {
+  if (archetype === 'brute') return 'Zoiemre';
   if (archetype === 'flanker') return 'Recon Flanker';
   if (archetype === 'heavy') return 'Heavy Breacher';
   return 'Assault Trooper';
+}
+
+export interface EnemyArchetypeProfile {
+  archetype: EnemyArchetype;
+  displayName: string;
+  hp: number;
+  speed: number;
+  attackDamage: number;
+  attackRange: number;
+  attackCooldownSec: number;
+  windupSec: number;
+  collisionRadius: number;
+  killScoreBonus: number;
+}
+
+export function getEnemyArchetypeProfile(
+  archetype: EnemyArchetype,
+  waveCfg: WaveConfig = getWaveConfig(1),
+): EnemyArchetypeProfile {
+  if (archetype === 'brute') {
+    return {
+      archetype: 'brute',
+      displayName: 'Zoiemre',
+      hp: Math.round(waveCfg.enemyHp * 2.5),
+      speed: Number((waveCfg.baseSpeed * 0.86).toFixed(2)),
+      attackDamage: 22,
+      attackRange: 2.55,
+      attackCooldownSec: 1.25,
+      windupSec: 0.34,
+      collisionRadius: 0.72,
+      killScoreBonus: 150,
+    };
+  }
+  if (archetype === 'heavy') {
+    return {
+      archetype: 'heavy',
+      displayName: 'Heavy Breacher',
+      hp: Math.round(waveCfg.enemyHp * 1.3),
+      speed: Number((waveCfg.baseSpeed * 0.94).toFixed(2)),
+      attackDamage: 14,
+      attackRange: 2.25,
+      attackCooldownSec: 1.1,
+      windupSec: 0.3,
+      collisionRadius: 0.6,
+      killScoreBonus: 50,
+    };
+  }
+  if (archetype === 'flanker') {
+    return {
+      archetype: 'flanker',
+      displayName: 'Recon Flanker',
+      hp: waveCfg.enemyHp,
+      speed: Number((waveCfg.baseSpeed * 1.15).toFixed(2)),
+      attackDamage: ENEMY_CONTACT_DAMAGE,
+      attackRange: ENEMY_ATTACK_RANGE,
+      attackCooldownSec: ENEMY_ATTACK_COOLDOWN_SEC,
+      windupSec: ENEMY_WINDUP_SEC,
+      collisionRadius: ENEMY_RADIUS,
+      killScoreBonus: 0,
+    };
+  }
+  return {
+    archetype: 'assault',
+    displayName: 'Assault Trooper',
+    hp: waveCfg.enemyHp,
+    speed: waveCfg.baseSpeed,
+    attackDamage: ENEMY_CONTACT_DAMAGE,
+    attackRange: ENEMY_ATTACK_RANGE,
+    attackCooldownSec: ENEMY_ATTACK_COOLDOWN_SEC,
+    windupSec: ENEMY_WINDUP_SEC,
+    collisionRadius: ENEMY_RADIUS,
+    killScoreBonus: 0,
+  };
 }
 
 export function createKillFeedEntry(
@@ -583,7 +657,8 @@ export function createKillFeedEntry(
   lifetimeSec: number = KILL_FEED_LIFETIME_SEC,
   weaponName: string = 'Assault Rifle',
 ): KillFeedEntry {
-  const points = SCORE_ENEMY_ELIMINATED + (isHeadshot ? SCORE_HEADSHOT_BONUS : 0);
+  const bonus = archetype === 'brute' ? 150 : 0;
+  const points = SCORE_ENEMY_ELIMINATED + bonus + (isHeadshot ? SCORE_HEADSHOT_BONUS : 0);
   return {
     id,
     kind: 'kill',
@@ -874,17 +949,357 @@ export function selectEnemySpawnPoint(
 
 export function pickEnemyArchetype(wave: number, spawnIndex: number): EnemyArchetype {
   if (wave === 1) {
-    return spawnIndex % 2 === 0 ? 'assault' : 'flanker';
+    const cycle: EnemyArchetype[] = ['assault', 'flanker', 'heavy'];
+    return cycle[Math.abs(spawnIndex) % cycle.length];
   }
-  const mod = spawnIndex % 3;
-  if (mod === 0) return 'assault';
-  if (mod === 1) return 'flanker';
-  return 'heavy';
+  if (wave === 2) {
+    const cycle: EnemyArchetype[] = ['assault', 'flanker', 'heavy', 'brute'];
+    return cycle[Math.abs(spawnIndex) % cycle.length];
+  }
+  const cycle: EnemyArchetype[] = ['assault', 'heavy', 'brute', 'flanker'];
+  return cycle[Math.abs(spawnIndex) % cycle.length];
 }
 
 /**
- * Steps a single enemy's AI movement, obstacle avoidance, and attack cooldown/windup logic.
- * Returns updated enemy and any player damage dealt on this frame.
+ * Checks whether a 2D circle-swept segment from (x0, z0) to (x1, z1) with given clearance radius
+ * has an unobstructed line of sight past all axis-aligned obstacle boxes.
+ */
+export function hasClearLineOfSight2D(
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+  clearanceRadius: number = ENEMY_RADIUS + 0.12,
+  obstacles: ObstacleBox[] = ARENA_OBSTACLES,
+): boolean {
+  const segDx = x1 - x0;
+  const segDz = z1 - z0;
+  const segLen = Math.hypot(segDx, segDz);
+  if (segLen < 1e-5) return true;
+
+  for (let i = 0; i < obstacles.length; i++) {
+    const obs = obstacles[i];
+    const minX = obs.x - obs.width * 0.5 - clearanceRadius;
+    const maxX = obs.x + obs.width * 0.5 + clearanceRadius;
+    const minZ = obs.z - obs.depth * 0.5 - clearanceRadius;
+    const maxZ = obs.z + obs.depth * 0.5 + clearanceRadius;
+
+    // Slab intersection test on [0, 1]
+    let tMin = 0;
+    let tMax = 1;
+
+    if (Math.abs(segDx) < 1e-6) {
+      if (x0 < minX || x0 > maxX) continue;
+    } else {
+      const invX = 1 / segDx;
+      let t1 = (minX - x0) * invX;
+      let t2 = (maxX - x0) * invX;
+      if (t1 > t2) {
+        const tmp = t1;
+        t1 = t2;
+        t2 = tmp;
+      }
+      tMin = Math.max(tMin, t1);
+      tMax = Math.min(tMax, t2);
+      if (tMin > tMax) continue;
+    }
+
+    if (Math.abs(segDz) < 1e-6) {
+      if (z0 < minZ || z0 > maxZ) continue;
+    } else {
+      const invZ = 1 / segDz;
+      let t1 = (minZ - z0) * invZ;
+      let t2 = (maxZ - z0) * invZ;
+      if (t1 > t2) {
+        const tmp = t1;
+        t1 = t2;
+        t2 = tmp;
+      }
+      tMin = Math.max(tMin, t1);
+      tMax = Math.min(tMax, t2);
+      if (tMin > tMax) continue;
+    }
+
+    if (tMax >= tMin && tMax > 0.02 && tMin < 0.98) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Pre-allocated A* navigation grid structures (Zero-GC per frame)
+const NAV_GRID_DIM = 36;
+const NAV_MIN_COORD = -18.0;
+const NAV_CELL_SIZE = 1.0; // Covers [-18, +18] in 36x36 cells
+const _navBlocked = new Uint8Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navGScore = new Float32Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navFScore = new Float32Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navCameFrom = new Int16Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navVisitedTag = new Uint32Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navClosedTag = new Uint32Array(NAV_GRID_DIM * NAV_GRID_DIM);
+const _navOpenList = new Int16Array(NAV_GRID_DIM * NAV_GRID_DIM);
+let _navSearchCounter = 1;
+let _cachedObstaclesRef: ObstacleBox[] | null = null;
+let _cachedObstaclesLen = -1;
+
+const NAV_DIRS_8: ReadonlyArray<readonly [number, number, number]> = [
+  [1, 0, 1.0],
+  [-1, 0, 1.0],
+  [0, 1, 1.0],
+  [0, -1, 1.0],
+  [1, 1, 1.4142],
+  [1, -1, 1.4142],
+  [-1, 1, 1.4142],
+  [-1, -1, 1.4142],
+];
+
+function worldToNavCell(coord: number): number {
+  const idx = Math.floor((coord - NAV_MIN_COORD) / NAV_CELL_SIZE);
+  return Math.max(0, Math.min(NAV_GRID_DIM - 1, idx));
+}
+
+function navCellToWorld(cellIdx: number): number {
+  return NAV_MIN_COORD + (cellIdx + 0.5) * NAV_CELL_SIZE;
+}
+
+function ensureNavGridBuilt(obstacles: ObstacleBox[], inflateRadius: number): void {
+  if (_cachedObstaclesRef === obstacles && _cachedObstaclesLen === obstacles.length) {
+    return;
+  }
+  _cachedObstaclesRef = obstacles;
+  _cachedObstaclesLen = obstacles.length;
+  _navBlocked.fill(0);
+
+  for (let gz = 0; gz < NAV_GRID_DIM; gz++) {
+    const wz = navCellToWorld(gz);
+    for (let gx = 0; gx < NAV_GRID_DIM; gx++) {
+      const wx = navCellToWorld(gx);
+      let blocked = 0;
+      for (let i = 0; i < obstacles.length; i++) {
+        const obs = obstacles[i];
+        const halfW = obs.width * 0.5 + inflateRadius;
+        const halfD = obs.depth * 0.5 + inflateRadius;
+        if (
+          wx >= obs.x - halfW &&
+          wx <= obs.x + halfW &&
+          wz >= obs.z - halfD &&
+          wz <= obs.z + halfD
+        ) {
+          blocked = 1;
+          break;
+        }
+      }
+      _navBlocked[gz * NAV_GRID_DIM + gx] = blocked;
+    }
+  }
+}
+
+function findNearestWalkableCell(startGx: number, startGz: number): { gx: number; gz: number } {
+  const startKey = startGz * NAV_GRID_DIM + startGx;
+  if (_navBlocked[startKey] === 0) {
+    return { gx: startGx, gz: startGz };
+  }
+  for (let r = 1; r <= 4; r++) {
+    for (let dz = -r; dz <= r; dz++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const nx = startGx + dx;
+        const nz = startGz + dz;
+        if (nx < 0 || nx >= NAV_GRID_DIM || nz < 0 || nz >= NAV_GRID_DIM) continue;
+        if (_navBlocked[nz * NAV_GRID_DIM + nx] === 0) {
+          return { gx: nx, gz: nz };
+        }
+      }
+    }
+  }
+  return { gx: startGx, gz: startGz };
+}
+
+/**
+ * Advanced A* + Line-of-Sight String-Pulled Pathfinding Planner:
+ * 1. If the enemy has a direct, unobstructed 2D capsule line of sight to the goal, returns the direct vector.
+ * 2. Otherwise, runs an 8-directional A* search on the obstacle-inflated arena navigation grid and
+ *    applies Line-of-Sight string-pulling to return the furthest visible corner waypoint direction.
+ */
+export function computeAdvancedPathfindingDirection(
+  startX: number,
+  startZ: number,
+  goalX: number,
+  goalZ: number,
+  obstacles: ObstacleBox[] = ARENA_OBSTACLES,
+  clearanceRadius: number = ENEMY_RADIUS + 0.14,
+): { dirX: number; dirZ: number; waypointX: number; waypointZ: number; usedAStar: boolean } {
+  const directDx = goalX - startX;
+  const directDz = goalZ - startZ;
+  const directDist = Math.hypot(directDx, directDz);
+  if (directDist < 1e-4) {
+    return { dirX: 0, dirZ: 1, waypointX: goalX, waypointZ: goalZ, usedAStar: false };
+  }
+
+  // Fast path: direct line-of-sight is clear
+  if (
+    obstacles.length === 0 ||
+    hasClearLineOfSight2D(startX, startZ, goalX, goalZ, clearanceRadius, obstacles)
+  ) {
+    return {
+      dirX: directDx / directDist,
+      dirZ: directDz / directDist,
+      waypointX: goalX,
+      waypointZ: goalZ,
+      usedAStar: false,
+    };
+  }
+
+  ensureNavGridBuilt(obstacles, Math.max(0.55, clearanceRadius));
+
+  const startCell = findNearestWalkableCell(worldToNavCell(startX), worldToNavCell(startZ));
+  const goalCell = findNearestWalkableCell(worldToNavCell(goalX), worldToNavCell(goalZ));
+  const startIdx = startCell.gz * NAV_GRID_DIM + startCell.gx;
+  const goalIdx = goalCell.gz * NAV_GRID_DIM + goalCell.gx;
+
+  if (startIdx === goalIdx) {
+    return {
+      dirX: directDx / directDist,
+      dirZ: directDz / directDist,
+      waypointX: goalX,
+      waypointZ: goalZ,
+      usedAStar: false,
+    };
+  }
+
+  _navSearchCounter = (_navSearchCounter + 1) & 0x7fffffff || 1;
+  const tag = _navSearchCounter;
+
+  let openCount = 1;
+  _navOpenList[0] = startIdx;
+  _navVisitedTag[startIdx] = tag;
+  _navGScore[startIdx] = 0;
+  _navFScore[startIdx] = Math.hypot(goalCell.gx - startCell.gx, goalCell.gz - startCell.gz);
+  _navCameFrom[startIdx] = -1;
+
+  let bestReachedIdx = startIdx;
+  let bestHeuristic = _navFScore[startIdx];
+  let iterations = 0;
+
+  while (openCount > 0 && iterations < 650) {
+    iterations++;
+    // Pop node with lowest fScore
+    let bestPos = 0;
+    let currentIdx = _navOpenList[0];
+    let lowestF = _navFScore[currentIdx];
+    for (let i = 1; i < openCount; i++) {
+      const candidate = _navOpenList[i];
+      const f = _navFScore[candidate];
+      if (f < lowestF) {
+        lowestF = f;
+        currentIdx = candidate;
+        bestPos = i;
+      }
+    }
+
+    openCount--;
+    _navOpenList[bestPos] = _navOpenList[openCount];
+    _navClosedTag[currentIdx] = tag;
+
+    if (currentIdx === goalIdx) {
+      bestReachedIdx = goalIdx;
+      break;
+    }
+
+    const cx = currentIdx % NAV_GRID_DIM;
+    const cz = (currentIdx - cx) / NAV_GRID_DIM;
+
+    for (let d = 0; d < NAV_DIRS_8.length; d++) {
+      const [ox, oz, stepCost] = NAV_DIRS_8[d];
+      const nx = cx + ox;
+      const nz = cz + oz;
+      if (nx < 0 || nx >= NAV_GRID_DIM || nz < 0 || nz >= NAV_GRID_DIM) continue;
+
+      const neighborIdx = nz * NAV_GRID_DIM + nx;
+      if (_navBlocked[neighborIdx] !== 0 || _navClosedTag[neighborIdx] === tag) continue;
+
+      // Prevent diagonal corner cutting through blocked orthogonal neighbors
+      if (ox !== 0 && oz !== 0) {
+        if (
+          _navBlocked[cz * NAV_GRID_DIM + nx] !== 0 ||
+          _navBlocked[nz * NAV_GRID_DIM + cx] !== 0
+        ) {
+          continue;
+        }
+      }
+
+      const tentativeG = _navGScore[currentIdx] + stepCost;
+      if (_navVisitedTag[neighborIdx] !== tag || tentativeG < _navGScore[neighborIdx]) {
+        _navCameFrom[neighborIdx] = currentIdx;
+        _navGScore[neighborIdx] = tentativeG;
+        const h = Math.hypot(goalCell.gx - nx, goalCell.gz - nz);
+        _navFScore[neighborIdx] = tentativeG + h;
+        if (h < bestHeuristic) {
+          bestHeuristic = h;
+          bestReachedIdx = neighborIdx;
+        }
+        if (_navVisitedTag[neighborIdx] !== tag) {
+          _navVisitedTag[neighborIdx] = tag;
+          _navOpenList[openCount++] = neighborIdx;
+        }
+      }
+    }
+  }
+
+  // Reconstruct path from bestReachedIdx back to startIdx
+  const pathCells: number[] = [];
+  let curr = bestReachedIdx;
+  let safety = 0;
+  while (curr !== -1 && curr !== startIdx && safety < 160) {
+    pathCells.push(curr);
+    curr = _navCameFrom[curr];
+    safety++;
+  }
+
+  if (pathCells.length === 0) {
+    return {
+      dirX: directDx / directDist,
+      dirZ: directDz / directDist,
+      waypointX: goalX,
+      waypointZ: goalZ,
+      usedAStar: false,
+    };
+  }
+
+  // String-pulling: pick the furthest waypoint along the A* path that has clear line of sight from (startX, startZ)
+  let chosenWpX = navCellToWorld(pathCells[pathCells.length - 1] % NAV_GRID_DIM);
+  let chosenWpZ = navCellToWorld(Math.floor(pathCells[pathCells.length - 1] / NAV_GRID_DIM));
+
+  const maxLookahead = Math.min(pathCells.length, 8);
+  for (let k = 1; k <= maxLookahead; k++) {
+    const cell = pathCells[pathCells.length - k];
+    const wx = navCellToWorld(cell % NAV_GRID_DIM);
+    const wz = navCellToWorld(Math.floor(cell / NAV_GRID_DIM));
+    if (
+      k === 1 ||
+      hasClearLineOfSight2D(startX, startZ, wx, wz, clearanceRadius * 0.85, obstacles)
+    ) {
+      chosenWpX = wx;
+      chosenWpZ = wz;
+    } else {
+      break;
+    }
+  }
+
+  const wpDx = chosenWpX - startX;
+  const wpDz = chosenWpZ - startZ;
+  const wpLen = Math.hypot(wpDx, wpDz) || 1;
+  return {
+    dirX: wpDx / wpLen,
+    dirZ: wpDz / wpLen,
+    waypointX: chosenWpX,
+    waypointZ: chosenWpZ,
+    usedAStar: true,
+  };
+}
+
+/**
+ * Steps a single enemy's AI movement, A* + String-Pulled pathfinding, 12-ray Context Steering
+ * obstacle avoidance, inter-enemy crowd separation, and archetype-specific combat behavior.
  */
 export function stepEnemyAI(
   enemy: EnemyData,
@@ -913,8 +1328,13 @@ export function stepEnemyAI(
   const dz = playerZ - enemy.z;
   const distToPlayer = Math.hypot(dx, dz);
 
-  // Face the player smoothly
-  const targetYaw = Math.atan2(dx, dz);
+  const entityRadius =
+    enemy.archetype === 'brute'
+      ? 0.72
+      : enemy.archetype === 'heavy'
+        ? 0.6
+        : ENEMY_RADIUS;
+
   let nextAttackTimer = Math.max(0, enemy.attackTimerSec - clampedDt);
   let nextWindupTimer = enemy.windupTimerSec;
   let nextIsWindingUp = enemy.isWindingUp;
@@ -922,6 +1342,8 @@ export function stepEnemyAI(
   let startedAttackWindup = false;
 
   const withinAttackDistance = distToPlayer <= enemy.attackRange;
+  const archetypeWindupSec =
+    enemy.archetype === 'brute' ? 0.34 : ENEMY_WINDUP_SEC;
 
   if (nextIsWindingUp) {
     nextWindupTimer -= clampedDt;
@@ -936,7 +1358,7 @@ export function stepEnemyAI(
     }
   } else if (withinAttackDistance && nextAttackTimer <= 0 && canStartNewAttack) {
     nextIsWindingUp = true;
-    nextWindupTimer = ENEMY_WINDUP_SEC;
+    nextWindupTimer = archetypeWindupSec;
     startedAttackWindup = true;
   }
 
@@ -945,34 +1367,60 @@ export function stepEnemyAI(
   let nextVx = 0;
   let nextVz = 0;
   let nextWalkCycle = enemy.walkCycle;
+  let targetYaw = Math.atan2(dx, dz);
 
   // Move toward player if outside stop distance and not mid-strike
   const stopDist = enemy.attackRange * 0.82;
   if (distToPlayer > stopDist && !nextIsWindingUp) {
-    let dirX = dx / Math.max(distToPlayer, 1e-4);
-    let dirZ = dz / Math.max(distToPlayer, 1e-4);
+    // 1. Compute A* + String-Pulled Navigation Waypoint Direction around obstacles
+    const navPlan = computeAdvancedPathfindingDirection(
+      enemy.x,
+      enemy.z,
+      playerX,
+      playerZ,
+      obstacles,
+      entityRadius + 0.14,
+    );
 
-    // Distinct archetype policies:
-    // 1. 'flanker': approaches at an angled flanking curve when at medium range
-    if (enemy.archetype === 'flanker' && distToPlayer > 4.2) {
-      const flankAngle = 0.52 * enemy.flankSign; // ~30 deg
-      const cosA = Math.cos(flankAngle);
-      const sinA = Math.sin(flankAngle);
-      const rotX = dirX * cosA - dirZ * sinA;
-      const rotZ = dirX * sinA + dirZ * cosA;
-      dirX = rotX;
-      dirZ = rotZ;
+    let dirX = navPlan.dirX;
+    let dirZ = navPlan.dirZ;
+
+    // 2. Archetype tactical movement modifiers when line-of-sight is clear:
+    if (!navPlan.usedAStar) {
+      if (enemy.archetype === 'flanker' && distToPlayer > 4.2) {
+        // Flanking arc approach
+        const flankAngle = 0.52 * enemy.flankSign;
+        const cosA = Math.cos(flankAngle);
+        const sinA = Math.sin(flankAngle);
+        const rotX = dirX * cosA - dirZ * sinA;
+        const rotZ = dirX * sinA + dirZ * cosA;
+        if (
+          hasClearLineOfSight2D(
+            enemy.x,
+            enemy.z,
+            enemy.x + rotX * 2.2,
+            enemy.z + rotZ * 2.2,
+            entityRadius,
+            obstacles,
+          )
+        ) {
+          dirX = rotX;
+          dirZ = rotZ;
+        }
+      }
     }
 
-    // 2. 'heavy': steady advance with brief surge when medium-close
+    // 3. Archetype speed scaling & mid-range surges
     let effectiveSpeed = enemy.speed;
-    if (enemy.archetype === 'heavy' && distToPlayer > 3.0 && distToPlayer < 8.5) {
+    if (enemy.archetype === 'brute') {
+      effectiveSpeed = enemy.speed * (distToPlayer > 3.2 && distToPlayer < 9.5 ? 1.14 : 1.0);
+    } else if (enemy.archetype === 'heavy' && distToPlayer > 3.0 && distToPlayer < 8.5) {
       effectiveSpeed = enemy.speed * 1.15;
     } else if (enemy.archetype === 'flanker') {
       effectiveSpeed = enemy.speed * 1.12;
     }
 
-    // Soft separation from other living enemies so they don't stack on one point
+    // 4. Crowd separation force from neighboring living enemies
     let sepX = 0;
     let sepZ = 0;
     for (let i = 0; i < allEnemies.length; i++) {
@@ -981,61 +1429,116 @@ export function stepEnemyAI(
       const odx = enemy.x - other.x;
       const odz = enemy.z - other.z;
       const odistSq = odx * odx + odz * odz;
-      const minSep = ENEMY_RADIUS * 2.2;
+      const minSep = (entityRadius + ENEMY_RADIUS) * 1.15;
       if (odistSq > 1e-5 && odistSq < minSep * minSep) {
         const odist = Math.sqrt(odistSq);
         const push = (minSep - odist) / minSep;
-        sepX += (odx / odist) * push * 0.9;
-        sepZ += (odz / odist) * push * 0.9;
+        sepX += (odx / odist) * push * 0.95;
+        sepZ += (odz / odist) * push * 0.95;
       }
     }
 
-    // Obstacle feeler steering so enemies steer around barriers instead of getting stuck
-    let steerX = dirX + sepX;
-    let steerZ = dirZ + sepZ;
-    const steerLen = Math.hypot(steerX, steerZ);
-    if (steerLen > 1e-5) {
-      steerX /= steerLen;
-      steerZ /= steerLen;
+    let desiredX = dirX + sepX;
+    let desiredZ = dirZ + sepZ;
+    const desiredLen = Math.hypot(desiredX, desiredZ);
+    if (desiredLen > 1e-5) {
+      desiredX /= desiredLen;
+      desiredZ /= desiredLen;
     }
 
-    const probeDist = 1.15;
-    const probeX = enemy.x + steerX * probeDist;
-    const probeZ = enemy.z + steerZ * probeDist;
-    const probeCollision = resolveEntityCollision(probeX, probeZ, ENEMY_RADIUS, obstacles);
-    if (probeCollision.hitWall) {
-      // Try left and right tangent directions and pick the one closer to the player
-      const leftX = -steerZ;
-      const leftZ = steerX;
-      const rightX = steerZ;
-      const rightZ = -steerX;
+    // 5. 12-Direction Context Steering Whisker Evaluation around desired heading
+    //    Ensures smooth obstacle avoidance around barrier corners without getting snagged
+    const baseAngle = Math.atan2(desiredX, desiredZ);
+    const candidateAngles = [
+      0,
+      0.32 * enemy.flankSign,
+      -0.32 * enemy.flankSign,
+      0.68 * enemy.flankSign,
+      -0.68 * enemy.flankSign,
+      1.08 * enemy.flankSign,
+      -1.08 * enemy.flankSign,
+      1.52 * enemy.flankSign,
+      -1.52 * enemy.flankSign,
+      2.05 * enemy.flankSign,
+      -2.05 * enemy.flankSign,
+    ];
 
-      const leftDist = Math.hypot(playerX - (enemy.x + leftX), playerZ - (enemy.z + leftZ));
-      const rightDist = Math.hypot(playerX - (enemy.x + rightX), playerZ - (enemy.z + rightZ));
+    let bestSteerX = desiredX;
+    let bestSteerZ = desiredZ;
+    let bestScore = -1e9;
+    const prevSpeed = Math.hypot(enemy.vx, enemy.vz);
+    const prevDirX = prevSpeed > 0.05 ? enemy.vx / prevSpeed : desiredX;
+    const prevDirZ = prevSpeed > 0.05 ? enemy.vz / prevSpeed : desiredZ;
 
-      if (leftDist <= rightDist) {
-        steerX = steerX * 0.35 + leftX * 0.9;
-        steerZ = steerZ * 0.35 + leftZ * 0.9;
-      } else {
-        steerX = steerX * 0.35 + rightX * 0.9;
-        steerZ = steerZ * 0.35 + rightZ * 0.9;
+    for (let c = 0; c < candidateAngles.length; c++) {
+      const ang = baseAngle + candidateAngles[c];
+      const cx = Math.sin(ang);
+      const cz = Math.cos(ang);
+
+      const probeNear = resolveEntityCollision(
+        enemy.x + cx * 0.75,
+        enemy.z + cz * 0.75,
+        entityRadius,
+        obstacles,
+      );
+      const probeFar = resolveEntityCollision(
+        enemy.x + cx * 1.45,
+        enemy.z + cz * 1.45,
+        entityRadius,
+        obstacles,
+      );
+
+      if (probeNear.hitWall && c > 0) continue;
+
+      const alignDesired = cx * desiredX + cz * desiredZ;
+      const alignMomentum = cx * prevDirX + cz * prevDirZ;
+      const wallPenalty = (probeNear.hitWall ? 2.5 : 0) + (probeFar.hitWall ? 0.85 : 0);
+      const score = alignDesired * 1.65 + alignMomentum * 0.35 - wallPenalty;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestSteerX = cx;
+        bestSteerZ = cz;
       }
-      const norm = Math.hypot(steerX, steerZ) || 1;
-      steerX /= norm;
-      steerZ /= norm;
+      // If straight ahead (c === 0) is completely clear both near and far, take it immediately
+      if (c === 0 && !probeNear.hitWall && !probeFar.hitWall) {
+        break;
+      }
     }
 
-    nextVx = steerX * effectiveSpeed;
-    nextVz = steerZ * effectiveSpeed;
+    // Smooth velocity blend so enemies turn fluidly around corners
+    const steerBlend = Math.min(1, clampedDt * 14.0);
+    const blendedVx =
+      prevSpeed > 0.05
+        ? enemy.vx + (bestSteerX * effectiveSpeed - enemy.vx) * steerBlend
+        : bestSteerX * effectiveSpeed;
+    const blendedVz =
+      prevSpeed > 0.05
+        ? enemy.vz + (bestSteerZ * effectiveSpeed - enemy.vz) * steerBlend
+        : bestSteerZ * effectiveSpeed;
+    const blendedMag = Math.hypot(blendedVx, blendedVz);
+    if (blendedMag > 1e-4) {
+      nextVx = (blendedVx / blendedMag) * effectiveSpeed;
+      nextVz = (blendedVz / blendedMag) * effectiveSpeed;
+    } else {
+      nextVx = bestSteerX * effectiveSpeed;
+      nextVz = bestSteerZ * effectiveSpeed;
+    }
 
     const candidateX = enemy.x + nextVx * clampedDt;
     const candidateZ = enemy.z + nextVz * clampedDt;
-    const resolved = resolveEntityCollision(candidateX, candidateZ, ENEMY_RADIUS, obstacles);
+    const resolved = resolveEntityCollision(candidateX, candidateZ, entityRadius, obstacles);
 
     nextX = resolved.x;
     nextZ = resolved.z;
     const moved = Math.hypot(nextX - enemy.x, nextZ - enemy.z);
-    nextWalkCycle += moved * 3.6;
+    const strideMult = enemy.archetype === 'brute' ? 2.9 : 3.6;
+    nextWalkCycle += moved * strideMult;
+
+    // Face movement heading while navigating around obstacles, or face player when close
+    if (navPlan.usedAStar && distToPlayer > enemy.attackRange * 1.5 && moved > 1e-4) {
+      targetYaw = Math.atan2(nextX - enemy.x, nextZ - enemy.z);
+    }
   }
 
   return {
@@ -1911,3 +2414,132 @@ export function selectDistantGunfirePosition(
     z: Math.sin(angle) * radius,
   };
 }
+
+/**
+ * Per-weapon anti-repeat history for independent Transient, Body, and Mechanical audio sample layers.
+ */
+export interface LayeredGunshotHistory {
+  lastTransientIndex: number;
+  lastBodyIndex: number;
+  lastMechanicalIndex: number;
+}
+
+/**
+ * Output of the layered weapon firing selector:
+ * - Independent sample indices (`0 .. poolSize - 1`) for Transient, Body, and Mechanical layers
+ * - Independent natural pitch randomization (`playbackRate`) per layer to prevent repetitive gunshots
+ * - Per-layer gain and mechanical action timing offset (`mechanicalDelaySec`)
+ */
+export interface LayeredGunshotSelection {
+  weaponId: WeaponId;
+  transientSampleIndex: number;
+  bodySampleIndex: number;
+  mechanicalSampleIndex: number;
+  transientPitch: number;
+  bodyPitch: number;
+  mechanicalPitch: number;
+  tailPitch: number;
+  transientGain: number;
+  bodyGain: number;
+  mechanicalGain: number;
+  mechanicalDelaySec: number;
+}
+
+function pickNonRepeatingSampleIndex(
+  poolSize: number,
+  lastIndex: number,
+  rng: () => number,
+): number {
+  if (poolSize <= 1) return 0;
+  let candidate = Math.floor(rng() * poolSize) % poolSize;
+  if (candidate < 0) candidate = 0;
+  if (candidate === lastIndex) {
+    candidate = (candidate + 1 + (Math.floor(rng() * (poolSize - 1)) % (poolSize - 1))) % poolSize;
+  }
+  return candidate;
+}
+
+/**
+ * Selects independent sample variations for the Transient, Body, and Mechanical gunshot layers
+ * (preventing consecutive repeats in any layer) and computes layer-specific pitch randomization
+ * and mechanical action timing so consecutive shots never sound identical.
+ */
+export function selectLayeredGunshotParams(
+  weaponId: WeaponId,
+  history: LayeredGunshotHistory = {
+    lastTransientIndex: -1,
+    lastBodyIndex: -1,
+    lastMechanicalIndex: -1,
+  },
+  poolSize: number = 3,
+  rng: () => number = Math.random,
+): { selection: LayeredGunshotSelection; nextHistory: LayeredGunshotHistory } {
+  const safePool = Math.max(1, Math.floor(poolSize));
+  const transientSampleIndex = pickNonRepeatingSampleIndex(
+    safePool,
+    history.lastTransientIndex,
+    rng,
+  );
+  const bodySampleIndex = pickNonRepeatingSampleIndex(safePool, history.lastBodyIndex, rng);
+  const mechanicalSampleIndex = pickNonRepeatingSampleIndex(
+    safePool,
+    history.lastMechanicalIndex,
+    rng,
+  );
+
+  // Pitch randomization ranges tailored per layer & weapon:
+  // Transient layer: +-4.5% (0.955 .. 1.045) for crisp supersonic crack variation
+  // Body layer: +-3.5% (0.965 .. 1.035) to keep sub-bass weight tight and natural
+  // Mechanical layer: +-5.0% (0.950 .. 1.050) for organic metallic bolt/pump/cylinder variation
+  const transientSpread = weaponId === 'shotgun' ? 0.09 : 0.085;
+  const bodySpread = weaponId === 'shotgun' ? 0.075 : 0.068;
+  const mechSpread = 0.096;
+
+  const transientPitch = Number(
+    (1 - transientSpread * 0.5 + rng() * transientSpread).toFixed(4),
+  );
+  const bodyPitch = Number((1 - bodySpread * 0.5 + rng() * bodySpread).toFixed(4));
+  const mechanicalPitch = Number((1 - mechSpread * 0.5 + rng() * mechSpread).toFixed(4));
+  const tailPitch = Number((0.965 + rng() * 0.07).toFixed(4));
+
+  const baseMechDelay =
+    weaponId === 'shotgun' ? 0.138 : weaponId === 'pistol' ? 0.017 : 0.014;
+  const mechanicalDelaySec = Number(
+    (baseMechDelay + (rng() - 0.5) * 0.004).toFixed(4),
+  );
+
+  const transientGain = Number(
+    ((weaponId === 'shotgun' ? 0.94 : 0.91) * (0.96 + rng() * 0.08)).toFixed(3),
+  );
+  const bodyGain = Number(
+    ((weaponId === 'shotgun' ? 0.96 : weaponId === 'pistol' ? 0.93 : 0.9) *
+      (0.96 + rng() * 0.08)).toFixed(3),
+  );
+  const mechanicalGain = Number(
+    ((weaponId === 'shotgun' ? 0.46 : weaponId === 'pistol' ? 0.38 : 0.42) *
+      (0.94 + rng() * 0.12)).toFixed(3),
+  );
+
+  return {
+    selection: {
+      weaponId,
+      transientSampleIndex,
+      bodySampleIndex,
+      mechanicalSampleIndex,
+      transientPitch,
+      bodyPitch,
+      mechanicalPitch,
+      tailPitch,
+      transientGain,
+      bodyGain,
+      mechanicalGain,
+      mechanicalDelaySec,
+    },
+    nextHistory: {
+      lastTransientIndex: transientSampleIndex,
+      lastBodyIndex: bodySampleIndex,
+      lastMechanicalIndex: mechanicalSampleIndex,
+    },
+  };
+}
+
